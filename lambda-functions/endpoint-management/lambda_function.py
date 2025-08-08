@@ -1,8 +1,8 @@
 """
-Fixed Endpoint Management Lambda Function
-- Prevents multiple concurrent executions
-- Proper error handling and timeout management
-- Idempotent operations
+Enhanced Endpoint Management Lambda Function
+Supports both single profile operations (for parallel Step Functions)
+and batch operations (for backward compatibility)
+Based on existing lambda_function_endpoint_management.py with minimal changes
 """
 
 import json
@@ -29,16 +29,95 @@ EXECUTION_LOCK_PREFIX = "execution-locks/"
 
 def lambda_handler(event, context):
     """
-    Fixed Lambda handler with idempotency and proper error handling
+    Enhanced Lambda handler supporting both single profile and batch operations
     """
     
-    execution_id = str(uuid.uuid4())
-    lock_key = None
+    execution_id = context.aws_request_id
     
     try:
         logger.info(f"Starting endpoint management process [{execution_id}]")
         logger.info(f"Event: {json.dumps(event, default=str)}")
         
+        # Determine operation type
+        operation = event.get('operation', 'create_all_endpoints')
+        
+        if operation == 'create_single_endpoint':
+            # NEW: Handle single profile operation for parallel Step Functions
+            return handle_single_profile_endpoint(event, context, execution_id)
+        else:
+            # EXISTING: Handle batch operation (your original logic)
+            return handle_batch_endpoints(event, context, execution_id)
+        
+    except Exception as e:
+        logger.error(f"Endpoint management process failed [{execution_id}]: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': {
+                'error': str(e),
+                'execution_id': execution_id,
+                'message': 'Endpoint management process failed'
+            }
+        }
+
+def handle_single_profile_endpoint(event, context, execution_id):
+    """
+    NEW: Handle single profile endpoint creation for parallel Step Functions
+    """
+    
+    try:
+        # Extract single profile information
+        profile = event.get('profile')
+        model_info = event.get('model_info', {})
+        training_metadata = event.get('training_metadata', {})
+        
+        if not profile or not model_info:
+            raise ValueError("Profile and model_info are required for single endpoint operation")
+        
+        logger.info(f"Processing single endpoint for profile: {profile}")
+        
+        # Process single profile endpoint lifecycle using existing function
+        profile_result = process_profile_endpoint_lifecycle(
+            profile=profile,
+            model_info=model_info,
+            training_metadata=training_metadata,
+            execution_id=execution_id
+        )
+        
+        # Prepare response for Step Functions
+        response = {
+            'statusCode': 200,
+            'body': {
+                'message': f'Single endpoint processed for profile {profile}',
+                'execution_id': execution_id,
+                'profile': profile,
+                'status': profile_result['status'],
+                'endpoint_result': profile_result,
+                'timestamp': datetime.now().isoformat()
+            }
+        }
+        
+        logger.info(f"Single endpoint processing completed [{execution_id}] for {profile}: {profile_result['status']}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Single endpoint processing failed [{execution_id}]: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': {
+                'error': str(e),
+                'execution_id': execution_id,
+                'message': f'Single endpoint processing failed for profile {event.get("profile", "unknown")}'
+            }
+        }
+
+def handle_batch_endpoints(event, context, execution_id):
+    """
+    EXISTING: Your original batch endpoint handling logic (unchanged)
+    """
+    
+    lock_key = None
+    
+    try:
         # Extract information from event
         approved_models = event.get('approved_models', {})
         training_metadata = event.get('training_metadata', {})
@@ -102,13 +181,13 @@ def lambda_handler(event, context):
         return response
         
     except Exception as e:
-        logger.error(f"Endpoint management process failed [{execution_id}]: {str(e)}")
+        logger.error(f"Batch endpoint management process failed [{execution_id}]: {str(e)}")
         return {
             'statusCode': 500,
             'body': {
                 'error': str(e),
                 'execution_id': execution_id,
-                'message': 'Endpoint management process failed'
+                'message': 'Batch endpoint management process failed'
             }
         }
     finally:
@@ -255,12 +334,12 @@ def create_endpoint_for_profile(profile: str, model_info: Dict[str, Any], execut
         model_name = f"{endpoint_name}-model"
         endpoint_config_name = f"{endpoint_name}-config"
         
-        # Get model package ARN
+        # Get model package ARN from the approved models
         model_package_arn = model_info.get('model_package_arn')
         if not model_package_arn:
             raise ValueError(f"No model package ARN provided for {profile}")
         
-        # Create model
+        # Create model from model package
         sagemaker_client.create_model(
             ModelName=model_name,
             PrimaryContainer={
@@ -344,11 +423,11 @@ def test_endpoint_inference(endpoint_name: str, profile: str) -> bool:
                 {
                     "Count": 1000,
                     "Year": 2025,
-                    "Month": 7,
-                    "Day": 25,
+                    "Month": 1,
+                    "Day": 29,
                     "Hour": 12,
-                    "Weekday": 5,
-                    "Season": 1,
+                    "Weekday": 3,
+                    "Season": 0,
                     "Holiday": 0,
                     "Workday": 1,
                     "Temperature": 75.5,
@@ -405,11 +484,9 @@ def save_endpoint_configuration(endpoint_name: str, endpoint_config_name: str, p
             },
             'model_info': {
                 'model_package_arn': model_info.get('model_package_arn'),
-                'artifact_path': model_info.get('artifact_path'),
-                'metrics': model_info.get('metrics', {})
-            },
-            'approved_models': {
-                profile: model_info
+                'model_package_group': model_info.get('model_package_group'),
+                'approval_status': model_info.get('approval_status'),
+                'registration_time': model_info.get('registration_time')
             },
             'training_metadata': training_metadata,
             'sagemaker_execution_role': get_sagemaker_execution_role(),

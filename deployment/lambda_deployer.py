@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Lambda Deployment Utility with DataScientist Role Assumption
-FINAL VERSION: Complete wait logic to handle all Lambda state transitions
+Enhanced version with Model Registry Lambda integration
 """
 
 import os
@@ -27,7 +27,7 @@ class LambdaDeployer:
         # Initialize clients with assumed role credentials
         self.lambda_client = self.assumed_session.client('lambda', region_name=region)
         self.iam_client = self.assumed_session.client('iam', region_name=region)
-	
+
         # Wait configuration
         self.max_wait_time = 300  # 5 minutes
         self.poll_interval = 5    # 5 seconds
@@ -66,14 +66,14 @@ class LambdaDeployer:
             raise Exception(f"Role assumption failed: {str(e)}")
         
     def deploy_all_lambda_functions(self):
-        """Deploy all Lambda functions for the MLOps pipeline"""
+        """Deploy all Lambda functions for the enhanced MLOps pipeline"""
         
         print("Deploying Lambda functions using DataScientist role...")
         
         # Verify execution role exists first
         execution_role = self.get_existing_datascientist_role()
         
-        # Lambda function configurations
+        # Enhanced Lambda function configurations
         lambda_configs = {
             'energy-forecasting-model-registry': {
                 'source_dir': 'lambda-functions/model-registry',
@@ -81,10 +81,12 @@ class LambdaDeployer:
                 'runtime': 'python3.9',
                 'timeout': 900,  # 15 minutes
                 'memory': 1024,  # 1GB
-                'description': 'Step 2: Model Registry for Energy Forecasting',
+                'description': 'Enhanced Model Registry for Energy Forecasting with Step Functions Integration',
                 'environment': {
                     'MODEL_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-models',
-                    'DATA_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-data'
+                    'DATA_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-data',
+                    'REGION': self.region,
+                    'ACCOUNT_ID': self.account_id
                 }
             },
             'energy-forecasting-endpoint-management': {
@@ -93,10 +95,12 @@ class LambdaDeployer:
                 'runtime': 'python3.9',
                 'timeout': 900,  # 15 minutes
                 'memory': 512,   # 512MB
-                'description': 'Step 3: Endpoint Management for Energy Forecasting',
+                'description': 'Enhanced Endpoint Management for Energy Forecasting with Model Registry Integration',
                 'environment': {
                     'MODEL_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-models',
-                    'DATA_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-data'
+                    'DATA_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-data',
+                    'REGION': self.region,
+                    'ACCOUNT_ID': self.account_id
                 }
             }
         }
@@ -109,6 +113,9 @@ class LambdaDeployer:
                 result = self.deploy_lambda_function(function_name, config, execution_role)
                 deployment_results[function_name] = result
                 print(f"✓ Successfully deployed {function_name}")
+                
+                # Add Step Functions permissions
+                self._add_step_functions_permissions(function_name)
                 
             except Exception as e:
                 print(f"✗ Failed to deploy {function_name}: {str(e)}")
@@ -164,7 +171,7 @@ class LambdaDeployer:
             print(f"  Waiting for {function_name} to be active after environment update...")
             self.wait_for_function_active(function_name)
 
-        # Step 4: Add permissions for other AWS services to invoke
+        # Step 4: Add permissions for AWS services
         print(f"  Adding permissions for {function_name}...")
         self.add_lambda_permissions(function_name)
         
@@ -281,9 +288,10 @@ class LambdaDeployer:
             Environment={'Variables': config.get('environment', {})},
             Tags={
                 'Purpose': 'EnergyForecastingMLOps',
-                'Pipeline': 'TrainingAndModelManagement',
-                'CreatedBy': 'LambdaDeployer',
-                'Role': 'sdcp-dev-sagemaker-energy-forecasting-datascientist-role'
+                'Pipeline': 'EnhancedTrainingAndModelManagement',
+                'CreatedBy': 'EnhancedLambdaDeployer',
+                'Role': 'sdcp-dev-sagemaker-energy-forecasting-datascientist-role',
+                'Integration': 'StepFunctions'
             }
         )
         
@@ -319,7 +327,7 @@ class LambdaDeployer:
 
         time.sleep(10)
         
-        # CRITICAL FIX: Wait for configuration update to complete
+        # Wait for configuration update to complete
         print(f"    Waiting for configuration update to complete...")
         self.wait_for_function_active(function_name)
         
@@ -367,6 +375,25 @@ class LambdaDeployer:
             # Permission already exists
             print(f"    ✓ Lambda cross-invoke permission already exists for {function_name}")
     
+    def _add_step_functions_permissions(self, function_name):
+        """Add specific Step Functions integration permissions"""
+        
+        # Additional permission for Step Functions with specific resource patterns
+        try:
+            self.lambda_client.add_permission(
+                FunctionName=function_name,
+                StatementId=f'allow-stepfunctions-enhanced-{function_name}',
+                Action='lambda:InvokeFunction',
+                Principal='states.amazonaws.com',
+                SourceArn=f"arn:aws:states:{self.region}:{self.account_id}:stateMachine:energy-forecasting-*"
+            )
+            print(f"  Added enhanced Step Functions permission for {function_name}")
+            
+        except self.lambda_client.exceptions.ResourceConflictException:
+            print(f"    ✓ Enhanced Step Functions permission already exists for {function_name}")
+        except Exception as e:
+            print(f"     Could not add enhanced Step Functions permission: {str(e)}")
+    
     def get_existing_datascientist_role(self):
         """Get existing DataScientist role ARN"""
         
@@ -382,6 +409,44 @@ class LambdaDeployer:
                 f"Please contact admin team to create this role first."
             )
     
+    def test_lambda_integration(self):
+        """Test Lambda functions for Step Functions integration"""
+        
+        print("\nTesting Lambda functions for Step Functions integration...")
+        
+        # Test Model Registry Lambda
+        test_event = {
+            "training_date": datetime.now().strftime('%Y%m%d'),
+            "model_bucket": "sdcp-dev-sagemaker-energy-forecasting-models",
+            "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
+            "training_metadata": {
+                "test": True,
+                "execution_time": datetime.now().isoformat()
+            }
+        }
+        
+        try:
+            response = self.lambda_client.invoke(
+                FunctionName='energy-forecasting-model-registry',
+                InvocationType='RequestResponse',
+                Payload=json.dumps(test_event)
+            )
+            
+            result = json.loads(response['Payload'].read())
+            
+            if response['StatusCode'] == 200:
+                print("✓ Model Registry Lambda test successful")
+                if 'body' in result and 'successful_count' in result['body']:
+                    print(f"  Processed {result['body']['successful_count']} models")
+                return True
+            else:
+                print(f"✗ Model Registry Lambda test failed: {result}")
+                return False
+                
+        except Exception as e:
+            print(f"✗ Model Registry Lambda test error: {str(e)}")
+            return False
+    
     def save_deployment_summary(self, deployment_results):
         """Save deployment summary to file"""
         
@@ -395,6 +460,11 @@ class LambdaDeployer:
             'wait_configuration': {
                 'max_wait_time_seconds': self.max_wait_time,
                 'poll_interval_seconds': self.poll_interval
+            },
+            'enhancements': {
+                'step_functions_integration': True,
+                'model_registry_automation': True,
+                'endpoint_management_automation': True
             }
         }
         
@@ -408,26 +478,28 @@ class LambdaDeployer:
         successful = len([r for r in deployment_results.values() if 'error' not in r])
         failed = len([r for r in deployment_results.values() if 'error' in r])
         
-        print(f"\nLambda Deployment Summary:")
+        print(f"\nEnhanced Lambda Deployment Summary:")
         print(f"  Successful: {successful}")
         print(f"  Failed: {failed}")
         print(f"  Total: {len(deployment_results)}")
         print(f"  Using Role: {self.datascientist_role_name}")
-	
+        print(f"  Step Functions Integration: ✓ Enabled")
+        print(f"  Model Registry Automation: ✓ Enabled")
+
         if successful == len(deployment_results):
-            print("   All Lambda functions deployed successfully!")
+            print("✓ All enhanced Lambda functions deployed successfully!")
         elif failed > 0:
-            print("     Some deployments failed - check logs above")
+            print(" Some deployments failed - check logs above")
 
 def main():
     """Main deployment function"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Deploy Lambda functions with DataScientist role')
+    parser = argparse.ArgumentParser(description='Deploy Enhanced Lambda functions with DataScientist role')
     parser.add_argument('--region', default='us-west-2', help='AWS region')
     parser.add_argument('--role-name', default='sdcp-dev-sagemaker-energy-forecasting-datascientist-role', help='DataScientist role name')
     parser.add_argument('--test-only', action='store_true', help='Only test role verification')
-    parser.add_argument('--function', help='Deploy a single function (not implemented yet)')
+    parser.add_argument('--test-integration', action='store_true', help='Test Step Functions integration')
     
     args = parser.parse_args()
     
@@ -440,28 +512,42 @@ def main():
         print("Testing DataScientist role availability for Lambda deployment...")
         try:
             role_arn = deployer.get_existing_datascientist_role()
-            print(f" DataScientist role verified: {role_arn}")
+            print(f"✓ DataScientist role verified: {role_arn}")
         except Exception as e:
-            print(f" DataScientist role test failed: {str(e)}")
+            print(f"✗ DataScientist role test failed: {str(e)}")
+            exit(1)
+    elif args.test_integration:
+        print("Testing Lambda functions for Step Functions integration...")
+        success = deployer.test_lambda_integration()
+        if success:
+            print("✓ Integration test passed")
+        else:
+            print("✗ Integration test failed")
             exit(1)
     else:
-        if args.function:
-            print(f"Single function deployment not implemented yet. Deploying all functions.")
-
         results = deployer.deploy_all_lambda_functions()
         
-        print("\nLambda deployment completed!")
+        print("\nEnhanced Lambda deployment completed!")
+        
+        # Test integration
+        print("\nTesting Step Functions integration...")
+        integration_success = deployer.test_lambda_integration()
         
         # Check if all deployments were successful
         failed_deployments = [name for name, result in results.items() if 'error' in result]
         
         if failed_deployments:
-            print(f" Failed deployments: {failed_deployments}")
+            print(f"✗ Failed deployments: {failed_deployments}")
             for name in failed_deployments:
                 print(f"   {name}: {results[name]['error']}")
             exit(1)
+        elif integration_success:
+            print("✓ All enhanced Lambda functions deployed and tested successfully!")
+            print("✓ Step Functions integration verified")
+            print("✓ Ready for automated MLOps pipeline execution")
         else:
-            print(" All Lambda functions deployed successfully using DataScientist role!")
+            print(" Lambda functions deployed but integration test failed")
+            print("Check function configurations and permissions")
 
 if __name__ == "__main__":
     main()

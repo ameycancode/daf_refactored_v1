@@ -135,7 +135,7 @@ class CodeBuildManager:
             return f's3://{bucket_name}/{s3_key}'
            
         except Exception as e:
-            print(f"❌ Failed to upload source: {str(e)}")
+            print(f" Failed to upload source: {str(e)}")
             os.unlink(temp_zip_path)
             raise
    
@@ -160,7 +160,7 @@ class CodeBuildManager:
             return build_id
            
         except Exception as e:
-            print(f"❌ Failed to start build: {str(e)}")
+            print(f" Failed to start build: {str(e)}")
             raise
    
     def wait_for_build(self, build_id, timeout_minutes=30):
@@ -181,7 +181,7 @@ class CodeBuildManager:
                 print(f"Build status: {build_status}, Phase: {current_phase}")
                
                 if build_status == 'SUCCEEDED':
-                    print("✅ Build completed successfully!")
+                    print(" Build completed successfully!")
                    
                     # Print build logs location
                     if 'logs' in build and 'groupName' in build['logs']:
@@ -192,7 +192,7 @@ class CodeBuildManager:
                     return True
                
                 elif build_status in ['FAILED', 'FAULT', 'STOPPED', 'TIMED_OUT']:
-                    print(f"❌ Build failed with status: {build_status}")
+                    print(f" Build failed with status: {build_status}")
                    
                     # Print failure reason if available
                     if 'buildStatusDetails' in build:
@@ -203,7 +203,7 @@ class CodeBuildManager:
                 elif build_status == 'IN_PROGRESS':
                     # Check timeout
                     if time.time() - start_time > timeout_seconds:
-                        print(f"❌ Build timed out after {timeout_minutes} minutes")
+                        print(f" Build timed out after {timeout_minutes} minutes")
                         return False
                    
                     # Wait before next check
@@ -220,7 +220,7 @@ class CodeBuildManager:
     def build_containers(self):
         """Complete container build process"""
         try:
-            print("🚀 Starting container build process via CodeBuild...")
+            print(" Starting container build process via CodeBuild...")
            
             # Step 1: Create CodeBuild project
             self.create_codebuild_project()
@@ -235,14 +235,14 @@ class CodeBuildManager:
             success = self.wait_for_build(build_id)
            
             if success:
-                print("✅ All container images built and pushed successfully via CodeBuild!")
+                print(" All container images built and pushed successfully via CodeBuild!")
                 return True
             else:
-                print("❌ Container build failed")
+                print(" Container build failed")
                 return False
                
         except Exception as e:
-            print(f"❌ CodeBuild process failed: {str(e)}")
+            print(f" CodeBuild process failed: {str(e)}")
             return False
 
 def main():

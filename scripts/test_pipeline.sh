@@ -1,13 +1,13 @@
 #!/bin/bash
 # Test pipeline script
 
-echo "🧪 Testing Energy Forecasting MLOps Pipeline..."
+echo " Testing Energy Forecasting MLOps Pipeline..."
 
 # Verify prerequisites
 echo "Verifying prerequisites..."
 python scripts/verify_roles.py
 if [ $? -ne 0 ]; then
-    echo "❌ Prerequisites not met. Please complete admin setup first."
+    echo " Prerequisites not met. Please complete admin setup first."
     exit 1
 fi
 
@@ -23,4 +23,4 @@ python deployment/lambda_deployer.py --test-only
 echo "Testing training pipeline..."
 python deployment/test_pipeline.py
 
-echo "✅ Pipeline testing complete!"
+echo " Pipeline testing complete!"
