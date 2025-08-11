@@ -484,16 +484,16 @@ def get_enhanced_prediction_pipeline_definition(roles, account_id, region, data_
                             }
                         }
                     ],
-                    "ProcessingOutputs": [
-                        {
-                            "OutputName": "predictions",
-                            "S3Output": {
-                                "S3Uri": f"s3://{data_bucket}/archived_folders/forecasting/data/xgboost/output/",
-                                "LocalPath": "/opt/ml/processing/output",
-                                "S3UploadMode": "EndOfJob"
-                            }
-                        }
-                    ],
+                    # "ProcessingOutputs": [
+                    #     {
+                    #         "OutputName": "predictions",
+                    #         "S3Output": {
+                    #             "S3Uri": f"s3://{data_bucket}/archived_folders/forecasting/data/xgboost/output/",
+                    #             "LocalPath": "/opt/ml/processing/output",
+                    #             "S3UploadMode": "EndOfJob"
+                    #         }
+                    #     }
+                    # ],
                     "RoleArn": roles['datascientist_role'],
                     "Environment": {
                         "DATA_BUCKET": data_bucket,
