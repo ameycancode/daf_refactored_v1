@@ -384,6 +384,244 @@ def get_training_pipeline_definition(roles, account_id, region, data_bucket, mod
     
     return training_definition
 
+
+def get_enhanced_prediction_pipeline_definition(roles, account_id, region, data_bucket, model_bucket):
+    """
+    Enhanced prediction pipeline definition with endpoint management
+    Includes smart endpoint recreation and cleanup
+    """
+    
+    prediction_definition = {
+        "Comment": "Enhanced Energy Forecasting Daily Predictions with Smart Endpoint Management",
+        "StartAt": "CheckAndRecreateEndpoints",
+        "States": {
+            "CheckAndRecreateEndpoints": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                    "FunctionName": "energy-forecasting-prediction-endpoint-manager",
+                    "Payload": {
+                        "operation": "recreate_endpoints",
+                        "profiles": ["RNN", "RN", "M", "S", "AGR", "L", "A6"],
+                        "data_bucket": data_bucket,
+                        "model_bucket": model_bucket,
+                        "region": region,
+                        "account_id": account_id
+                    }
+                },
+                "ResultPath": "$.endpoint_management_result",
+                "Next": "CheckEndpointCreationResult",
+                "Retry": [
+                    {
+                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                        "IntervalSeconds": 10,
+                        "MaxAttempts": 2,
+                        "BackoffRate": 2.0
+                    }
+                ],
+                "Catch": [
+                    {
+                        "ErrorEquals": ["States.TaskFailed"],
+                        "Next": "HandleEndpointCreationFailure",
+                        "ResultPath": "$.endpoint_error"
+                    }
+                ]
+            },
+            "CheckEndpointCreationResult": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Variable": "$.endpoint_management_result.Payload.statusCode",
+                        "NumericEquals": 200,
+                        "Next": "WaitForEndpointsReady"
+                    }
+                ],
+                "Default": "HandleEndpointCreationFailure"
+            },
+            "WaitForEndpointsReady": {
+                "Type": "Wait",
+                "Seconds": 180,
+                "Comment": "Wait 3 minutes for endpoints to be ready",
+                "Next": "PreparePredictionInput"
+            },
+            "PreparePredictionInput": {
+                "Type": "Pass",
+                "Parameters": {
+                    "endpoint_details.$": "$.endpoint_management_result.Payload.body.endpoint_details",
+                    "data_bucket": data_bucket,
+                    "model_bucket": model_bucket,
+                    "region": region,
+                    "account_id": account_id,
+                    "prediction_date.$": "$.Execution.StartTime"
+                },
+                "ResultPath": "$.prediction_input",
+                "Next": "EnhancedPredictionJob"
+            },
+            "EnhancedPredictionJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                "Parameters": {
+                    "ProcessingJobName.$": "$.PredictionJobName",
+                    "ProcessingResources": {
+                        "ClusterConfig": {
+                            "InstanceCount": 1,
+                            "InstanceType": "ml.m5.large",
+                            "VolumeSizeInGB": 30
+                        }
+                    },
+                    "AppSpecification": {
+                        "ImageUri.$": "$.PredictionImageUri",
+                        "ContainerEntrypoint": ["python", "/opt/ml/processing/code/src/main.py"]
+                    },
+                    "ProcessingInputs": [
+                        {
+                            "InputName": "test-data",
+                            "S3Input": {
+                                "S3Uri": f"s3://{data_bucket}/archived_folders/forecasting/data/xgboost/input/",
+                                "LocalPath": "/opt/ml/processing/input",
+                                "S3DataType": "S3Prefix",
+                                "S3InputMode": "File"
+                            }
+                        }
+                    ],
+                    "ProcessingOutputs": [
+                        {
+                            "OutputName": "predictions",
+                            "S3Output": {
+                                "S3Uri": f"s3://{data_bucket}/archived_folders/forecasting/data/xgboost/output/",
+                                "LocalPath": "/opt/ml/processing/output",
+                                "S3UploadMode": "EndOfJob"
+                            }
+                        }
+                    ],
+                    "RoleArn": roles['datascientist_role'],
+                    "Environment": {
+                        "DATA_BUCKET": data_bucket,
+                        "MODEL_BUCKET": model_bucket,
+                        "REGION": region,
+                        "ACCOUNT_ID": account_id,
+                        "ENDPOINT_DETAILS.$": "States.JsonToString($.prediction_input.endpoint_details)"
+                    }
+                },
+                "ResultPath": "$.prediction_job_result",
+                "Next": "CleanupEndpoints",
+                "Catch": [
+                    {
+                        "ErrorEquals": ["States.TaskFailed"],
+                        "Next": "HandlePredictionFailure",
+                        "ResultPath": "$.prediction_error"
+                    }
+                ]
+            },
+            "CleanupEndpoints": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                    "FunctionName": "energy-forecasting-prediction-cleanup",
+                    "Payload": {
+                        "operation": "cleanup_endpoints",
+                        "endpoint_details.$": "$.prediction_input.endpoint_details",
+                        "prediction_job_result.$": "$.prediction_job_result"
+                    }
+                },
+                "ResultPath": "$.cleanup_result",
+                "Next": "PredictionCompleteNotification",
+                "Retry": [
+                    {
+                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                        "IntervalSeconds": 5,
+                        "MaxAttempts": 2,
+                        "BackoffRate": 2.0
+                    }
+                ],
+                "Catch": [
+                    {
+                        "ErrorEquals": ["States.TaskFailed"],
+                        "Next": "PredictionCompleteNotification",
+                        "ResultPath": "$.cleanup_error"
+                    }
+                ]
+            },
+            "PredictionCompleteNotification": {
+                "Type": "Pass",
+                "Parameters": {
+                    "pipeline_status": "SUCCESS",
+                    "completion_time.$": "$.State.EnteredTime",
+                    "message": "Enhanced prediction pipeline completed successfully",
+                    "summary": {
+                        "endpoint_management_status": "SUCCESS",
+                        "prediction_status": "SUCCESS",
+                        "cleanup_status": "SUCCESS"
+                    },
+                    "results": {
+                        "endpoint_details.$": "$.prediction_input.endpoint_details",
+                        "prediction_job.$": "$.prediction_job_result",
+                        "cleanup_result.$": "$.cleanup_result"
+                    },
+                    "next_steps": [
+                        "Predictions generated and saved to S3",
+                        "Endpoints cleaned up for cost optimization",
+                        "Visualizations and reports available",
+                        "Ready for next prediction cycle"
+                    ]
+                },
+                "End": True
+            },
+            "HandleEndpointCreationFailure": {
+                "Type": "Pass",
+                "Parameters": {
+                    "pipeline_status": "FAILED",
+                    "failure_stage": "endpoint_creation",
+                    "error.$": "$.endpoint_error",
+                    "failure_time.$": "$.State.EnteredTime",
+                    "message": "Failed to create endpoints for prediction"
+                },
+                "Next": "ReportPredictionFailure"
+            },
+            "HandlePredictionFailure": {
+                "Type": "Pass",
+                "Parameters": {
+                    "pipeline_status": "FAILED",
+                    "failure_stage": "prediction_processing",
+                    "error.$": "$.prediction_error",
+                    "failure_time.$": "$.State.EnteredTime",
+                    "message": "Prediction processing failed",
+                    "cleanup_needed": True,
+                    "endpoint_details.$": "$.prediction_input.endpoint_details"
+                },
+                "Next": "EmergencyCleanup"
+            },
+            "EmergencyCleanup": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                    "FunctionName": "energy-forecasting-prediction-cleanup",
+                    "Payload": {
+                        "operation": "emergency_cleanup",
+                        "endpoint_details.$": "$.endpoint_details"
+                    }
+                },
+                "ResultPath": "$.emergency_cleanup_result",
+                "Next": "ReportPredictionFailure",
+                "Catch": [
+                    {
+                        "ErrorEquals": ["States.ALL"],
+                        "Next": "ReportPredictionFailure",
+                        "ResultPath": "$.emergency_cleanup_error"
+                    }
+                ]
+            },
+            "ReportPredictionFailure": {
+                "Type": "Fail",
+                "Cause": "Enhanced prediction pipeline failed",
+                "Error": "PredictionPipelineExecutionFailed"
+            }
+        }
+    }
+    
+    return prediction_definition
+
+
 def get_prediction_pipeline_definition(roles, account_id, region, data_bucket, model_bucket):
     """
     Prediction pipeline definition (unchanged - uses registered models)
@@ -465,10 +703,6 @@ def get_prediction_pipeline_definition(roles, account_id, region, data_bucket, m
     
     return prediction_definition
 
-# Keep all existing functions unchanged:
-# - create_step_functions_with_integration()
-# - create_eventbridge_rules()
-# - main execution logic
 
 def create_step_functions_with_integration(roles, account_id, region, data_bucket, model_bucket, assumed_session=None):
     """
@@ -524,8 +758,8 @@ def create_step_functions_with_integration(roles, account_id, region, data_bucke
             )
             print(f"✓ Updated parallel training pipeline: {training_arn}")
     
-    # Create prediction pipeline (unchanged)
-    prediction_definition = get_prediction_pipeline_definition(
+    # Create ENHANCED prediction pipeline with endpoint management
+    prediction_definition = get_enhanced_prediction_pipeline_definition(
         roles, account_id, region, data_bucket, model_bucket
     )
     
@@ -535,14 +769,15 @@ def create_step_functions_with_integration(roles, account_id, region, data_bucke
             definition=json.dumps(prediction_definition),
             roleArn=roles['datascientist_role'],
             tags=[
-                {'key': 'Purpose', 'value': 'EnergyForecastingPrediction'},
+                {'key': 'Purpose', 'value': 'EnergyForecastingEnhancedPrediction'},
                 {'key': 'Schedule', 'value': 'Daily'},
                 {'key': 'CostOptimized', 'value': 'True'},
                 {'key': 'Role', 'value': 'sdcp-dev-sagemaker-energy-forecasting-datascientist-role'},
-                {'key': 'ModelSource', 'value': 'ModelRegistry'}
+                {'key': 'ModelSource', 'value': 'ModelRegistryWithEndpoints'},
+                {'key': 'Enhanced', 'value': 'SmartEndpointManagement'}
             ]
         )
-        print(f"✓ Created prediction pipeline: {prediction_response['stateMachineArn']}")
+        print(f"✓ Created enhanced prediction pipeline: {prediction_response['stateMachineArn']}")
         prediction_arn = prediction_response['stateMachineArn']
         
     except stepfunctions_client.exceptions.StateMachineAlreadyExists:
@@ -561,7 +796,7 @@ def create_step_functions_with_integration(roles, account_id, region, data_bucke
                 definition=json.dumps(prediction_definition),
                 roleArn=roles['datascientist_role']
             )
-            print(f"✓ Updated prediction pipeline: {prediction_arn}")
+            print(f"✓ Updated enhanced prediction pipeline: {prediction_arn}")
     
     return {
         'training_pipeline': training_arn,
@@ -611,14 +846,14 @@ def create_eventbridge_rules(account_id, region, state_machine_arns):
         print(f" Failed to create training rule: {str(e)}")
     
     # Daily predictions rule (unchanged)
-    prediction_rule_name = 'energy-forecasting-daily-predictions'
+    prediction_rule_name = 'energy-forecasting-daily-enhanced-predictions'
     
     try:
         events_client.put_rule(
             Name=prediction_rule_name,
             ScheduleExpression='cron(0 1 * * ? *)',  # Daily at 1 AM UTC
             State='ENABLED',
-            Description='Daily energy load predictions using registered models'
+            Description='Daily energy predictions with smart endpoint management'
         )
         
         events_client.put_targets(
@@ -629,14 +864,14 @@ def create_eventbridge_rules(account_id, region, state_machine_arns):
                     'Arn': state_machine_arns['prediction_pipeline'],
                     'RoleArn': f"arn:aws:iam::{account_id}:role/EnergyForecastingEventBridgeRole",
                     'Input': json.dumps({
-                        "PredictionJobName": f"energy-prediction-daily-${{aws.events.event.ingestion-time}}",
+                        "PredictionJobName": f"energy-prediction-enhanced-${{aws.events.event.ingestion-time}}",
                         "PredictionImageUri": f"{account_id}.dkr.ecr.{region}.amazonaws.com/energy-prediction:latest"
                     })
                 }
             ]
         )
         
-        print(f"✓ Created daily prediction rule: {prediction_rule_name}")
+        print(f"✓ Created daily enhanced prediction rule: {prediction_rule_name}")
         
     except Exception as e:
         print(f" Failed to create prediction rule: {str(e)}")

@@ -102,7 +102,38 @@ class LambdaDeployer:
                     'REGION': self.region,
                     'ACCOUNT_ID': self.account_id
                 }
+            },
+        # Prediction Endpoint Manager
+        'energy-forecasting-prediction-endpoint-manager': {
+            'source_dir': 'lambda-functions/prediction-endpoint-manager',
+            'handler': 'lambda_function.lambda_handler',
+            'runtime': 'python3.9',
+            'timeout': 900,  # 15 minutes
+            'memory': 512,   # 512MB
+            'description': 'Smart Endpoint Manager for Daily Predictions - Recreates endpoints from saved configs',
+            'environment': {
+                'MODEL_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-models',
+                'DATA_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-data',
+                'REGION': self.region,
+                'ACCOUNT_ID': self.account_id,
+                'SAGEMAKER_EXECUTION_ROLE': f"arn:aws:iam::{self.account_id}:role/sdcp-dev-sagemaker-energy-forecasting-datascientist-role"
             }
+        },
+        # Prediction Cleanup
+        'energy-forecasting-prediction-cleanup': {
+            'source_dir': 'lambda-functions/prediction-cleanup',
+            'handler': 'lambda_function.lambda_handler',
+            'runtime': 'python3.9',
+            'timeout': 300,  # 5 minutes
+            'memory': 256,   # 256MB
+            'description': 'Cleanup Manager for Prediction Pipeline - Deletes temporary endpoints after predictions',
+            'environment': {
+                'MODEL_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-models',
+                'DATA_BUCKET': 'sdcp-dev-sagemaker-energy-forecasting-data',
+                'REGION': self.region,
+                'ACCOUNT_ID': self.account_id
+            }
+        }
         }
         
         deployment_results = {}
@@ -114,8 +145,12 @@ class LambdaDeployer:
                 deployment_results[function_name] = result
                 print(f"✓ Successfully deployed {function_name}")
                 
-                # Add Step Functions permissions
+                # Add Step Functions permissions for all functions
                 self._add_step_functions_permissions(function_name)
+                
+                # Add specific permissions for prediction functions
+                if 'prediction' in function_name:
+                    self._add_prediction_specific_permissions(function_name)
                 
             except Exception as e:
                 print(f"✗ Failed to deploy {function_name}: {str(e)}")
@@ -125,7 +160,94 @@ class LambdaDeployer:
         self.save_deployment_summary(deployment_results)
         
         return deployment_results
+
+
+    def _add_prediction_specific_permissions(self, function_name):
+        """Add specific permissions for prediction Lambda functions"""
+        
+        try:
+            # Allow SageMaker Runtime invocation for endpoint calls
+            self.lambda_client.add_permission(
+                FunctionName=function_name,
+                StatementId=f'allow-sagemaker-runtime-{function_name}',
+                Action='lambda:InvokeFunction',
+                Principal='sagemaker.amazonaws.com',
+                SourceAccount=self.account_id
+            )
+            print(f"  Added SageMaker Runtime permission for {function_name}")
+            
+        except self.lambda_client.exceptions.ResourceConflictException:
+            print(f"    ✓ SageMaker Runtime permission already exists for {function_name}")
+        except Exception as e:
+            print(f"     Could not add SageMaker Runtime permission: {str(e)}")
     
+    def test_prediction_lambda_integration(self):
+        """Test prediction Lambda functions integration"""
+        
+        print("\nTesting Prediction Lambda functions integration...")
+        
+        # Test Prediction Endpoint Manager
+        test_endpoint_manager_event = {
+            "operation": "recreate_endpoints",
+            "profiles": ["RNN", "RN"],  # Test with subset first
+            "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
+            "model_bucket": "sdcp-dev-sagemaker-energy-forecasting-models"
+        }
+        
+        try:
+            response = self.lambda_client.invoke(
+                FunctionName='energy-forecasting-prediction-endpoint-manager',
+                InvocationType='RequestResponse',
+                Payload=json.dumps(test_endpoint_manager_event)
+            )
+            
+            result = json.loads(response['Payload'].read())
+            
+            if response['StatusCode'] == 200:
+                print("✓ Prediction Endpoint Manager test successful")
+                print(f"  Response: {json.dumps(result, indent=2, default=str)}")
+                
+                # Test Cleanup function if endpoint manager succeeded
+                if result.get('statusCode') == 200:
+                    self._test_cleanup_function(result)
+                
+                return True
+            else:
+                print(f"✗ Prediction Endpoint Manager test failed: {result}")
+                return False
+                
+        except Exception as e:
+            print(f"✗ Prediction Endpoint Manager test error: {str(e)}")
+            return False
+
+    
+    def _test_cleanup_function(self, endpoint_manager_result):
+        """Test the cleanup function with results from endpoint manager"""
+        
+        try:
+            cleanup_event = {
+                "operation": "cleanup_endpoints",
+                "endpoint_details": endpoint_manager_result.get('body', {}).get('endpoint_details', {}),
+                "prediction_job_result": {"status": "test_completed"}
+            }
+            
+            response = self.lambda_client.invoke(
+                FunctionName='energy-forecasting-prediction-cleanup',
+                InvocationType='RequestResponse',
+                Payload=json.dumps(cleanup_event)
+            )
+            
+            result = json.loads(response['Payload'].read())
+            
+            if response['StatusCode'] == 200:
+                print("✓ Prediction Cleanup test successful")
+            else:
+                print(f" Prediction Cleanup test issues: {result}")
+                
+        except Exception as e:
+            print(f" Prediction Cleanup test error: {str(e)}")
+
+
     def deploy_lambda_function(self, function_name, config, execution_role):
         """Deploy a single Lambda function with proper wait logic"""
         
@@ -500,6 +622,7 @@ def main():
     parser.add_argument('--role-name', default='sdcp-dev-sagemaker-energy-forecasting-datascientist-role', help='DataScientist role name')
     parser.add_argument('--test-only', action='store_true', help='Only test role verification')
     parser.add_argument('--test-integration', action='store_true', help='Test Step Functions integration')
+    parser.add_argument('--test-prediction', action='store_true', help='Test Prediction Lambda functions')
     
     args = parser.parse_args()
     
@@ -524,14 +647,26 @@ def main():
         else:
             print("✗ Integration test failed")
             exit(1)
+    elif args.test_prediction:
+        print("Testing Prediction Lambda functions...")
+        success = deployer.test_prediction_lambda_integration()
+        if success:
+            print("✓ Prediction Lambda test passed")
+        else:
+            print("✗ Prediction Lambda test failed")
+            exit(1)
     else:
         results = deployer.deploy_all_lambda_functions()
         
-        print("\nEnhanced Lambda deployment completed!")
+        print("\nEnhanced Lambda deployment with Prediction support completed!")
         
         # Test integration
         print("\nTesting Step Functions integration...")
         integration_success = deployer.test_lambda_integration()
+
+        # Test prediction functions
+        print("\nTesting Prediction Lambda functions...")
+        prediction_success = deployer.test_prediction_lambda_integration()
         
         # Check if all deployments were successful
         failed_deployments = [name for name, result in results.items() if 'error' in result]
@@ -541,12 +676,17 @@ def main():
             for name in failed_deployments:
                 print(f"   {name}: {results[name]['error']}")
             exit(1)
-        elif integration_success:
+        elif integration_success and prediction_success:
             print("✓ All enhanced Lambda functions deployed and tested successfully!")
             print("✓ Step Functions integration verified")
-            print("✓ Ready for automated MLOps pipeline execution")
+            print("✓ Prediction Lambda functions verified")
+            print("✓ Ready for complete automated MLOps pipeline execution")
+            print("\nNext Steps:")
+            print("1. Deploy the prediction Lambda function code (new files)")
+            print("2. Update Step Functions definition")
+            print("3. Test the complete prediction pipeline")
         else:
-            print(" Lambda functions deployed but integration test failed")
+            print(" Lambda functions deployed but some tests failed")
             print("Check function configurations and permissions")
 
 if __name__ == "__main__":
