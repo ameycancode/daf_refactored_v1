@@ -1,6 +1,6 @@
 """
-Prediction Endpoint Manager Lambda Function
-Recreates endpoints from S3 configurations for daily predictions
+Fixed Enhanced Prediction Endpoint Manager Lambda Function
+Corrected to use the same model group naming pattern as training pipeline
 """
 
 import json
@@ -29,22 +29,33 @@ def lambda_handler(event, context):
         logger.info(f"Starting prediction endpoint management [{execution_id}]")
         logger.info(f"Event: {json.dumps(event, default=str)}")
         
-        # Configuration
+        # Configuration - FIXED model group naming pattern
         config = {
             "data_bucket": "sdcp-dev-sagemaker-energy-forecasting-data",
             "profiles": ["RNN", "RN", "M", "S", "AGR", "L", "A6"],
             "max_wait_time": 900,  # 15 minutes
-            "instance_type": "ml.t2.medium"  # Cost-optimized
+            "instance_type": "ml.t2.medium",  # Cost-optimized
+            "customer_profile": "SDCP",  # This matches your training pipeline
+            # FIXED: Use the same naming pattern as training pipeline
+            "model_registry_groups": {
+                "RNN": "EnergyForecastModels-SDCP-RNN",
+                "RN": "EnergyForecastModels-SDCP-RN", 
+                "M": "EnergyForecastModels-SDCP-M",
+                "S": "EnergyForecastModels-SDCP-S",
+                "AGR": "EnergyForecastModels-SDCP-AGR",
+                "L": "EnergyForecastModels-SDCP-L",
+                "A6": "EnergyForecastModels-SDCP-A6"
+            }
         }
         
-        # Extract operation type
+        # Extract operation and parameters
         operation = event.get('operation', 'recreate_all_endpoints')
         profiles_to_process = event.get('profiles', config['profiles'])
         
         logger.info(f"Operation: {operation}, Profiles: {profiles_to_process}")
         
         if operation == 'recreate_all_endpoints':
-            result = recreate_all_endpoints(profiles_to_process, config, execution_id)
+            result = recreate_all_endpoints_from_registry(profiles_to_process, config, execution_id)
         elif operation == 'check_endpoints_status':
             result = check_endpoints_status(profiles_to_process, execution_id)
         elif operation == 'cleanup_endpoints':
@@ -69,136 +80,130 @@ def lambda_handler(event, context):
             }
         }
 
-def recreate_all_endpoints(profiles: List[str], config: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
+def recreate_all_endpoints_from_registry(profiles: List[str], config: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
     """
-    Recreate endpoints for all profiles from S3 configurations
+    Recreate endpoints from latest approved models in Model Registry
     """
     
     try:
-        logger.info(f"Recreating endpoints for {len(profiles)} profiles")
+        logger.info(f"Recreating endpoints for {len(profiles)} profiles from Model Registry")
+        logger.info(f"Using model groups: {config['model_registry_groups']}")
         
         endpoint_details = {}
-        successful_count = 0
+        successful_creations = 0
         
+        # Create endpoints for each profile
         for profile in profiles:
             try:
-                logger.info(f"Processing endpoint recreation for profile: {profile}")
+                logger.info(f"Creating endpoint for profile: {profile}")
                 
-                # Load endpoint configuration from S3
-                endpoint_config = load_latest_endpoint_config(profile, config['data_bucket'])
-                
-                if not endpoint_config:
-                    logger.warning(f"No endpoint configuration found for profile {profile}")
-                    endpoint_details[profile] = {
-                        'status': 'config_not_found',
-                        'error': 'No endpoint configuration found in S3'
-                    }
-                    continue
-                
-                # Create endpoint from configuration
-                endpoint_result = create_endpoint_from_config(
-                    profile, endpoint_config, config, execution_id
-                )
-                
+                endpoint_result = create_endpoint_from_registry(profile, config, execution_id)
                 endpoint_details[profile] = endpoint_result
                 
                 if endpoint_result['status'] == 'success':
-                    successful_count += 1
+                    successful_creations += 1
                     
             except Exception as e:
-                logger.error(f"Failed to recreate endpoint for {profile}: {str(e)}")
+                logger.error(f"Failed to create endpoint for {profile}: {str(e)}")
                 endpoint_details[profile] = {
                     'status': 'failed',
-                    'error': str(e)
+                    'error': str(e),
+                    'profile': profile
                 }
         
-        # Wait for all successful endpoints to be InService
-        if successful_count > 0:
-            logger.info(f"Waiting for {successful_count} endpoints to be InService...")
-            wait_result = wait_for_endpoints_ready(endpoint_details, config['max_wait_time'])
-            
-            # Update status based on wait results
-            for profile, wait_status in wait_result.items():
-                if profile in endpoint_details and endpoint_details[profile]['status'] == 'success':
-                    endpoint_details[profile]['wait_result'] = wait_status
+        # Wait for all endpoints to be ready
+        if successful_creations > 0:
+            logger.info(f"Waiting for {successful_creations} endpoints to be ready...")
+            wait_results = wait_for_endpoints_ready(endpoint_details, config['max_wait_time'])
+        else:
+            wait_results = {}
         
         return {
             'message': f'Endpoint recreation completed for {len(profiles)} profiles',
             'execution_id': execution_id,
-            'successful_count': successful_count,
-            'failed_count': len(profiles) - successful_count,
+            'successful_creations': successful_creations,
+            'failed_creations': len(profiles) - successful_creations,
             'total_profiles': len(profiles),
             'endpoint_details': endpoint_details,
-            'timestamp': datetime.now().isoformat(),
-            'ready_for_predictions': successful_count > 0
+            'wait_results': wait_results,
+            'ready_for_predictions': successful_creations > 0,
+            'model_groups_used': {profile: config['model_registry_groups'].get(profile, 'N/A') for profile in profiles},
+            'timestamp': datetime.now().isoformat()
         }
         
     except Exception as e:
-        logger.error(f"Endpoint recreation failed: {str(e)}")
+        logger.error(f"Endpoint recreation process failed: {str(e)}")
         raise
 
-def load_latest_endpoint_config(profile: str, data_bucket: str) -> Optional[Dict[str, Any]]:
+def create_endpoint_from_registry(profile: str, config: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
     """
-    Load the latest endpoint configuration for a profile from S3
-    """
-    
-    try:
-        prefix = f"endpoint-configurations/{profile}/"
-        
-        # List all configurations for this profile
-        response = s3_client.list_objects_v2(
-            Bucket=data_bucket,
-            Prefix=prefix
-        )
-        
-        if 'Contents' not in response:
-            logger.warning(f"No endpoint configurations found for profile {profile}")
-            return None
-        
-        # Sort by last modified to get the latest
-        configs = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)
-        latest_config_key = configs[0]['Key']
-        
-        logger.info(f"Loading latest config for {profile}: {latest_config_key}")
-        
-        # Load the configuration
-        config_response = s3_client.get_object(Bucket=data_bucket, Key=latest_config_key)
-        config_data = json.loads(config_response['Body'].read())
-        
-        return config_data
-        
-    except Exception as e:
-        logger.error(f"Failed to load endpoint configuration for {profile}: {str(e)}")
-        return None
-
-def create_endpoint_from_config(profile: str, endpoint_config: Dict[str, Any], 
-                               config: Dict[str, Any], execution_id: str) -> Dict[str, Any]:
-    """
-    Create endpoint from saved configuration
+    Create endpoint from latest approved model in Model Registry
+    FIXED: Uses correct model group naming pattern
     """
     
     result = {
         'profile': profile,
         'status': 'failed',
-        'execution_id': execution_id,
         'creation_start_time': datetime.now().isoformat()
     }
     
     try:
-        # Generate new names with timestamp for uniqueness
+        # Get Model Registry group name - FIXED to match training pipeline
+        model_group_name = config['model_registry_groups'].get(profile)
+        if not model_group_name:
+            raise ValueError(f"No model group configured for profile {profile}")
+        
+        logger.info(f"Fetching latest approved model for {profile} from registry: {model_group_name}")
+        
+        # Get latest approved model package
+        response = sagemaker_client.list_model_packages(
+            ModelPackageGroupName=model_group_name,
+            ModelPackageType='Versioned',
+            SortBy='CreationTime',
+            SortOrder='Descending',
+            ModelApprovalStatus='Approved',
+            MaxResults=1
+        )
+        
+        if not response['ModelPackageSummaryList']:
+            # Try PendingManualApproval status as fallback
+            logger.warning(f"No approved models found for {profile}, trying PendingManualApproval")
+            response = sagemaker_client.list_model_packages(
+                ModelPackageGroupName=model_group_name,
+                ModelPackageType='Versioned',
+                SortBy='CreationTime',
+                SortOrder='Descending',
+                ModelApprovalStatus='PendingManualApproval',
+                MaxResults=1
+            )
+        
+        if not response['ModelPackageSummaryList']:
+            # Final fallback: try without approval status filter
+            logger.warning(f"No approved/pending models found for {profile}, trying any status")
+            response = sagemaker_client.list_model_packages(
+                ModelPackageGroupName=model_group_name,
+                ModelPackageType='Versioned',
+                SortBy='CreationTime',
+                SortOrder='Descending',
+                MaxResults=1
+            )
+        
+        if not response['ModelPackageSummaryList']:
+            raise ValueError(f"No models found in registry for {profile} in group {model_group_name}")
+        
+        model_package_arn = response['ModelPackageSummaryList'][0]['ModelPackageArn']
+        model_approval_status = response['ModelPackageSummaryList'][0]['ModelApprovalStatus']
+        logger.info(f"Using model package: {model_package_arn} (Status: {model_approval_status})")
+        
+        # Generate unique names with timestamp
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        model_name = f"energy-forecasting-pred-{profile.lower()}-{timestamp}"
-        endpoint_config_name = f"energy-forecasting-pred-{profile.lower()}-config-{timestamp}"
-        endpoint_name = f"energy-forecasting-pred-{profile.lower()}-endpoint-{timestamp}"
+        model_name = f"energy-forecasting-{profile.lower()}-model-{timestamp}"
+        endpoint_config_name = f"energy-forecasting-{profile.lower()}-config-{timestamp}"
+        endpoint_name = f"energy-forecasting-{profile.lower()}-endpoint-{timestamp}"
         
-        # Extract model package ARN from configuration
-        model_package_arn = endpoint_config.get('model_package_arn')
-        if not model_package_arn:
-            raise ValueError(f"No model package ARN found in configuration for {profile}")
+        # Create model from model package
+        logger.info(f"Creating model for {profile}: {model_name}")
         
-        logger.info(f"Creating prediction model for {profile}: {model_name}")
-        
-        # Step 1: Create model
         model_response = sagemaker_client.create_model(
             ModelName=model_name,
             Containers=[
@@ -206,39 +211,39 @@ def create_endpoint_from_config(profile: str, endpoint_config: Dict[str, Any],
                     'ModelPackageName': model_package_arn
                 }
             ],
-            ExecutionRoleArn=get_sagemaker_execution_role(),
+            ExecutionRoleArn=f"arn:aws:iam::{boto3.client('sts').get_caller_identity()['Account']}:role/sdcp-dev-sagemaker-energy-forecasting-datascientist-role",
             Tags=[
                 {'Key': 'Profile', 'Value': profile},
-                {'Key': 'Purpose', 'Value': 'PredictionEndpoint'},
+                {'Key': 'Purpose', 'Value': 'PredictionModel'},
                 {'Key': 'ExecutionId', 'Value': execution_id},
-                {'Key': 'CreatedBy', 'Value': 'PredictionEndpointManager'},
-                {'Key': 'Temporary', 'Value': 'True'}
+                {'Key': 'Temporary', 'Value': 'True'},
+                {'Key': 'ModelGroup', 'Value': model_group_name}
             ]
         )
         
-        # Step 2: Create endpoint configuration
-        logger.info(f"Creating prediction endpoint config for {profile}: {endpoint_config_name}")
+        # Create endpoint configuration
+        logger.info(f"Creating endpoint configuration for {profile}: {endpoint_config_name}")
         
-        endpoint_config_response = sagemaker_client.create_endpoint_config(
+        sagemaker_client.create_endpoint_config(
             EndpointConfigName=endpoint_config_name,
             ProductionVariants=[
                 {
-                    'VariantName': f'{profile}-prediction-variant',
+                    'VariantName': f'{profile}-variant',
                     'ModelName': model_name,
-                    'InitialInstanceCount': 1,
                     'InstanceType': config['instance_type'],
+                    'InitialInstanceCount': 1,
                     'InitialVariantWeight': 1.0
                 }
             ],
             Tags=[
                 {'Key': 'Profile', 'Value': profile},
-                {'Key': 'Purpose', 'Value': 'PredictionEndpoint'},
+                {'Key': 'Purpose', 'Value': 'PredictionEndpointConfig'},
                 {'Key': 'ExecutionId', 'Value': execution_id},
                 {'Key': 'Temporary', 'Value': 'True'}
             ]
         )
         
-        # Step 3: Create endpoint
+        # Create endpoint
         logger.info(f"Creating prediction endpoint for {profile}: {endpoint_name}")
         
         endpoint_response = sagemaker_client.create_endpoint(
@@ -259,6 +264,8 @@ def create_endpoint_from_config(profile: str, endpoint_config: Dict[str, Any],
             'endpoint_name': endpoint_name,
             'endpoint_arn': endpoint_response['EndpointArn'],
             'model_package_arn': model_package_arn,
+            'model_group_name': model_group_name,
+            'model_approval_status': model_approval_status,
             'creation_end_time': datetime.now().isoformat(),
             'endpoint_status': 'Creating'
         })
@@ -271,7 +278,8 @@ def create_endpoint_from_config(profile: str, endpoint_config: Dict[str, Any],
         logger.error(f"Failed to create endpoint for {profile}: {str(e)}")
         result.update({
             'error': str(e),
-            'creation_end_time': datetime.now().isoformat()
+            'creation_end_time': datetime.now().isoformat(),
+            'attempted_model_group': config['model_registry_groups'].get(profile, 'N/A')
         })
         return result
 
@@ -289,77 +297,98 @@ def wait_for_endpoints_ready(endpoint_details: Dict[str, Any], max_wait_time: in
         if details['status'] == 'success':
             endpoints_to_wait[profile] = details['endpoint_name']
     
-    logger.info(f"Waiting for {len(endpoints_to_wait)} endpoints to be InService")
+    if not endpoints_to_wait:
+        logger.warning("No successful endpoints to wait for")
+        return wait_results
     
+    logger.info(f"Waiting for {len(endpoints_to_wait)} endpoints to be ready")
+    
+    # Wait for endpoints
     while endpoints_to_wait and (time.time() - start_time) < max_wait_time:
-        completed_profiles = []
-        
-        for profile, endpoint_name in endpoints_to_wait.items():
+        for profile, endpoint_name in list(endpoints_to_wait.items()):
             try:
                 response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
                 status = response['EndpointStatus']
                 
-                logger.info(f"Endpoint {endpoint_name} ({profile}) status: {status}")
-                
                 if status == 'InService':
+                    logger.info(f"Endpoint {endpoint_name} is ready")
                     wait_results[profile] = 'InService'
-                    completed_profiles.append(profile)
-                elif status == 'Failed':
-                    failure_reason = response.get('FailureReason', 'Unknown error')
-                    wait_results[profile] = f'Failed: {failure_reason}'
-                    completed_profiles.append(profile)
-                    logger.error(f"Endpoint {endpoint_name} ({profile}) failed: {failure_reason}")
-                
-            except Exception as e:
-                if 'does not exist' in str(e):
-                    logger.info(f"Endpoint {endpoint_name} ({profile}) not ready yet")
+                    del endpoints_to_wait[profile]
+                    # Update endpoint details
+                    endpoint_details[profile]['endpoint_status'] = 'InService'
+                    endpoint_details[profile]['endpoint_url'] = response.get('EndpointUrl', '')
+                elif status in ['Failed', 'RollingBack']:
+                    logger.error(f"Endpoint {endpoint_name} failed: {status}")
+                    wait_results[profile] = f'Failed: {status}'
+                    del endpoints_to_wait[profile]
+                    endpoint_details[profile]['endpoint_status'] = status
+                    endpoint_details[profile]['error'] = f"Endpoint failed with status: {status}"
                 else:
-                    logger.error(f"Error checking endpoint {endpoint_name} ({profile}): {str(e)}")
-                    wait_results[profile] = f'Error: {str(e)}'
-                    completed_profiles.append(profile)
-        
-        # Remove completed endpoints from wait list
-        for profile in completed_profiles:
-            endpoints_to_wait.pop(profile, None)
+                    logger.info(f"Endpoint {endpoint_name} status: {status}")
+                    
+            except Exception as e:
+                logger.error(f"Error checking endpoint {endpoint_name}: {str(e)}")
+                wait_results[profile] = f'Error: {str(e)}'
+                del endpoints_to_wait[profile]
         
         if endpoints_to_wait:
             time.sleep(30)  # Wait 30 seconds before next check
     
-    # Handle timeouts
-    for profile in endpoints_to_wait:
+    # Handle timeout
+    for profile, endpoint_name in endpoints_to_wait.items():
+        logger.warning(f"Endpoint {endpoint_name} timed out waiting for InService")
         wait_results[profile] = 'Timeout'
-        logger.warning(f"Timeout waiting for endpoint {endpoints_to_wait[profile]} ({profile})")
+        endpoint_details[profile]['endpoint_status'] = 'Timeout'
     
     return wait_results
 
 def check_endpoints_status(profiles: List[str], execution_id: str) -> Dict[str, Any]:
     """
-    Check status of existing endpoints for profiles
+    Check status of existing endpoints
     """
     
     try:
-        logger.info(f"Checking status of endpoints for {len(profiles)} profiles")
-        
-        endpoint_statuses = {}
+        status_results = {}
         
         for profile in profiles:
             try:
-                # This would require storing current endpoint names somewhere
-                # For now, we'll return that endpoints need to be recreated
-                endpoint_statuses[profile] = {
-                    'status': 'not_found',
-                    'message': 'No active endpoints found, recreation needed'
-                }
+                # Try to find endpoint with pattern
+                paginator = sagemaker_client.get_paginator('list_endpoints')
+                
+                endpoint_found = False
+                for page in paginator.paginate():
+                    for endpoint in page['Endpoints']:
+                        if f"energy-forecasting-{profile.lower()}" in endpoint['EndpointName']:
+                            response = sagemaker_client.describe_endpoint(
+                                EndpointName=endpoint['EndpointName']
+                            )
+                            status_results[profile] = {
+                                'endpoint_name': endpoint['EndpointName'],
+                                'status': response['EndpointStatus'],
+                                'creation_time': response['CreationTime'].isoformat(),
+                                'last_modified_time': response['LastModifiedTime'].isoformat()
+                            }
+                            endpoint_found = True
+                            break
+                    if endpoint_found:
+                        break
+                
+                if not endpoint_found:
+                    status_results[profile] = {
+                        'status': 'NotFound',
+                        'message': f'No endpoint found for profile {profile}'
+                    }
+                    
             except Exception as e:
-                endpoint_statuses[profile] = {
-                    'status': 'error',
+                status_results[profile] = {
+                    'status': 'Error',
                     'error': str(e)
                 }
         
         return {
-            'message': f'Status check completed for {len(profiles)} profiles',
+            'message': 'Endpoint status check completed',
             'execution_id': execution_id,
-            'endpoint_statuses': endpoint_statuses,
+            'status_results': status_results,
             'timestamp': datetime.now().isoformat()
         }
         
@@ -369,34 +398,48 @@ def check_endpoints_status(profiles: List[str], execution_id: str) -> Dict[str, 
 
 def cleanup_endpoints(profiles: List[str], execution_id: str) -> Dict[str, Any]:
     """
-    Cleanup prediction endpoints after use
-
+    Cleanup endpoints for specified profiles
     """
     
     try:
-        logger.info(f"Cleaning up prediction endpoints for {len(profiles)} profiles")
+        cleanup_results = {}
         
-        # This function would be called by the cleanup Lambda
-        # For now, return success
+        for profile in profiles:
+            try:
+                # Find and delete endpoints for this profile
+                paginator = sagemaker_client.get_paginator('list_endpoints')
+                
+                endpoints_deleted = 0
+                for page in paginator.paginate():
+                    for endpoint in page['Endpoints']:
+                        if f"energy-forecasting-{profile.lower()}" in endpoint['EndpointName']:
+                            try:
+                                sagemaker_client.delete_endpoint(
+                                    EndpointName=endpoint['EndpointName']
+                                )
+                                endpoints_deleted += 1
+                                logger.info(f"Deleted endpoint: {endpoint['EndpointName']}")
+                            except Exception as e:
+                                logger.warning(f"Could not delete endpoint {endpoint['EndpointName']}: {str(e)}")
+                
+                cleanup_results[profile] = {
+                    'status': 'success',
+                    'endpoints_deleted': endpoints_deleted
+                }
+                
+            except Exception as e:
+                cleanup_results[profile] = {
+                    'status': 'failed',
+                    'error': str(e)
+                }
+        
         return {
-            'message': f'Cleanup initiated for {len(profiles)} profiles',
+            'message': 'Endpoint cleanup completed',
             'execution_id': execution_id,
+            'cleanup_results': cleanup_results,
             'timestamp': datetime.now().isoformat()
         }
         
     except Exception as e:
         logger.error(f"Cleanup failed: {str(e)}")
         raise
-
-def get_sagemaker_execution_role() -> str:
-    """
-    Get the SageMaker execution role ARN
-    """
-    
-    try:
-        account_id = boto3.client('sts').get_caller_identity()['Account']
-        role_arn = f"arn:aws:iam::{account_id}:role/sdcp-dev-sagemaker-energy-forecasting-datascientist-role"
-        return role_arn
-    except Exception as e:
-        logger.error(f"Could not determine SageMaker execution role: {str(e)}")
-        raise Exception("SageMaker execution role not configured")
